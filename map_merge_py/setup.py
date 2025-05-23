@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'map_merge = map_merge_py.map_merge:main',
+            'explore_map = map_merge_py.explore_map:main',
         ],
     },
 )
