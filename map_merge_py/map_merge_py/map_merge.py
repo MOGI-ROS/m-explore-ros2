@@ -3,6 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from rosgraph_msgs.msg import Clock
+from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Header
 import tf2_ros
 import numpy as np
@@ -27,6 +28,8 @@ class MultiRobotMapMerger(Node):
         self.use_sim_time = self.get_parameter('sim_time').get_parameter_value().bool_value
         self.visualize = self.get_parameter('visualize').get_parameter_value().bool_value
         self.confidence_threshold = self.get_parameter('match_confidence_threshold').get_parameter_value().double_value
+
+        self.add_on_set_parameters_callback(self.update_parameter_callback)
 
         self.robot1_pos = (0.0, 0.0)
         self.robot2_pos = (0.0, 0.0)
@@ -54,6 +57,16 @@ class MultiRobotMapMerger(Node):
         if self.visualize:
             self.vis_thread = threading.Thread(target=self.visualization_loop, daemon=True)
             self.vis_thread.start()
+
+    def update_parameter_callback(self, params):
+        result = SetParametersResult(successful=True)
+        for param in params:
+            if param.name == 'match_confidence_threshold' and param.type_ == rclpy.Parameter.Type.DOUBLE:
+                self.confidence_threshold = param.value
+                self.get_logger().info(f'Updating minimum confidence threshold to {self.confidence_threshold}')
+                return result
+        # Return success, so updates are seen via get_parameter()
+        return result
 
     def clock_callback(self, msg):
         self.sim_time = msg.clock
