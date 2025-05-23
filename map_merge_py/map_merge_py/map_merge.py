@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 import math
 import threading
+import tf_transformations
 import time
 
 class MultiRobotMapMerger(Node):
@@ -104,19 +105,34 @@ class MultiRobotMapMerger(Node):
         else:
             now = self.get_clock().now().to_msg()
 
-        for frame, pos in zip(['robot_1/map', 'robot_2/map'], [self.robot1_pos, self.robot2_pos]):
-            tf = TransformStamped()
-            tf.header.stamp = now
-            tf.header.frame_id = 'world'
-            tf.child_frame_id = frame
-            tf.transform.translation.x = pos[0]
-            tf.transform.translation.y = pos[1]
-            tf.transform.translation.z = 0.0
-            tf.transform.rotation.x = 0.0
-            tf.transform.rotation.y = 0.0
-            tf.transform.rotation.z = 0.0
-            tf.transform.rotation.w = 1.0
-            self.broadcaster.sendTransform(tf)
+        # Robot 1 TF
+        tf1 = TransformStamped()
+        tf1.header.stamp = now
+        tf1.header.frame_id = 'world'
+        tf1.child_frame_id = 'robot_1/map'
+        tf1.transform.translation.x = self.robot1_pos[0]
+        tf1.transform.translation.y = self.robot1_pos[1]
+        tf1.transform.translation.z = 0.0
+        tf1.transform.rotation.x = 0.0
+        tf1.transform.rotation.y = 0.0
+        tf1.transform.rotation.z = 0.0
+        tf1.transform.rotation.w = 1.0
+        self.broadcaster.sendTransform(tf1)
+
+        # Robot 2 TF with rotation
+        tf2 = TransformStamped()
+        tf2.header.stamp = now
+        tf2.header.frame_id = 'world'
+        tf2.child_frame_id = 'robot_2/map'
+        tf2.transform.translation.x = self.robot2_pos[0]
+        tf2.transform.translation.y = self.robot2_pos[1]
+        tf2.transform.translation.z = 0.0
+        q = tf_transformations.quaternion_from_euler(0, 0, getattr(self, 'robot2_yaw', 0.0))
+        tf2.transform.rotation.x = q[0]
+        tf2.transform.rotation.y = q[1]
+        tf2.transform.rotation.z = q[2]
+        tf2.transform.rotation.w = q[3]
+        self.broadcaster.sendTransform(tf2)
 
     def map_publish_callback(self):
         if self.map1_img is None or self.map2_img is None:
@@ -158,8 +174,15 @@ class MultiRobotMapMerger(Node):
             canvas[(self.map1_img == 255) & (warped != 0) & (canvas != 0)] = 255
             canvas[(warped == 255) & (self.map1_img != 0) & (canvas != 0)] = 255
             self.robot1_pos = (-self.map1_info.origin.position.x, -self.map1_info.origin.position.y)
-            dx, dy = M[0, 2], M[1, 2]
-            self.robot2_pos = (dx * res - self.map2_info.origin.position.x, dy * res - self.map2_info.origin.position.y)
+            # Compute correct transformed origin
+            origin_px = np.array([[ -self.map2_info.origin.position.x / res,
+                                     -self.map2_info.origin.position.y / res ]], dtype=np.float32)
+            transformed_px = cv2.transform(origin_px[None, :, :], M)[0][0]
+            self.robot2_pos = (transformed_px[0] * res, transformed_px[1] * res)
+
+            # Store rotation for TF (in timer_callback)
+            theta = math.atan2(M[1, 0], M[0, 0])
+            self.robot2_yaw = theta
 
         self.merged_map_img = canvas
 
