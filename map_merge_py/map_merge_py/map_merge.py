@@ -162,6 +162,7 @@ class MultiRobotMapMerger(Node):
             canvas_region[mask] = self.map2_img[mask]
             self.robot1_pos = (-self.map1_info.origin.position.x, -self.map1_info.origin.position.y)
             self.robot2_pos = (-self.map2_info.origin.position.x, map2_offset_y * res - self.map2_info.origin.position.y)
+            self.robot2_yaw = 0.0
         else:
             src_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
             dst_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
