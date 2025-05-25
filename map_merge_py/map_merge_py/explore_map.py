@@ -57,9 +57,8 @@ class MultiRobotExplorer(Node):
         for param in params:
             if param.name == 'min_unknown_cells' and param.type_ == rclpy.Parameter.Type.INTEGER:
                 self.min_unknown_cells = param.value
-                self.get_logger().info(f'Updating minimum uknown cells threshold to {self.min_unknown_cells}')
+                self.get_logger().info(f'Updating minimum unknown cells threshold to {self.min_unknown_cells}')
                 return result
-        # Return success, so updates are seen via get_parameter()
         return result
 
     def clock_callback(self, msg):
@@ -79,12 +78,11 @@ class MultiRobotExplorer(Node):
             self.get_logger().warn("Waiting for all maps...")
             return
 
-
         mask_1 = self.compute_reachability_mask(self.global_map, 'robot_1/map')
         mask_2 = self.compute_reachability_mask(self.global_map, 'robot_2/map')
         reachable_mask = np.logical_or(mask_1, mask_2)
         global_frontiers = self.find_frontiers(self.global_map, reachable_mask)
-        self.publish_frontier_markers(global_frontiers, self.global_map, "global_frontiers")
+        self.publish_frontier_markers(global_frontiers, self.global_map, "global_frontiers", source_frame="world")
 
         if not global_frontiers:
             self.get_logger().info("No frontiers left in global map. Exploration complete.")
@@ -93,8 +91,8 @@ class MultiRobotExplorer(Node):
 
         local_frontiers_1 = self.find_frontiers(self.local_map_1)
         local_frontiers_2 = self.find_frontiers(self.local_map_2)
-        self.publish_frontier_markers(local_frontiers_1, self.global_map, "robot_1_frontiers")
-        self.publish_frontier_markers(local_frontiers_2, self.global_map, "robot_2_frontiers")
+        self.publish_frontier_markers(local_frontiers_1, self.local_map_1, "robot_1_frontiers", source_frame="robot_1/map")
+        self.publish_frontier_markers(local_frontiers_2, self.local_map_2, "robot_2_frontiers", source_frame="robot_2/map")
 
         if local_frontiers_1:
             self.send_goal(local_frontiers_1[0], self.local_map_1, 'robot_1/map', self.pub_1)
@@ -194,7 +192,7 @@ class MultiRobotExplorer(Node):
                 frontiers.append((y, x))
         return frontiers
 
-    def publish_frontier_markers(self, frontiers, map_msg, ns="frontiers"):
+    def publish_frontier_markers(self, frontiers, map_msg, ns="frontiers", source_frame="world"):
         marker_array = MarkerArray()
         marker = Marker()
         marker.header.frame_id = "world"
@@ -206,34 +204,56 @@ class MultiRobotExplorer(Node):
         marker.scale.x = 0.2
         marker.scale.y = 0.2
         marker.scale.z = 0.2
+        marker.color.a = 1.0
+
         if ns == "global_frontiers":
             marker.color.r = 1.0
             marker.color.g = 0.5
             marker.color.b = 0.0
-            marker.color.a = 1.0
         elif ns == "robot_1_frontiers":
             marker.color.r = 0.1
             marker.color.g = 1.0
             marker.color.b = 0.0
-            marker.color.a = 1.0
         elif ns == "robot_2_frontiers":
             marker.color.r = 0.1
             marker.color.g = 0.0
             marker.color.b = 1.0
-            marker.color.a = 1.0
         else:
             marker.color.r = 1.0
             marker.color.g = 0.0
             marker.color.b = 0.0
-            marker.color.a = 1.0
-        marker.lifetime = Duration(sec=2)
 
+        marker.lifetime = Duration(sec=2)
         resolution = map_msg.info.resolution
         origin = map_msg.info.origin.position
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'world', source_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5)
+            )
+        except Exception as e:
+            self.get_logger().warn(f"TF transform failed from {source_frame} to world: {e}")
+            return
+
         for y, x in frontiers:
-            px = origin.x + (x + 0.5) * resolution
-            py = origin.y + (y + 0.5) * resolution
-            marker.points.append(Point(x=px, y=py, z=0.1))
+            local_x = origin.x + (x + 0.5) * resolution
+            local_y = origin.y + (y + 0.5) * resolution
+            pose = PoseStamped()
+            pose.header.frame_id = source_frame
+            pose.pose.position.x = local_x
+            pose.pose.position.y = local_y
+            pose.pose.position.z = 0.1
+            pose.pose.orientation.w = 1.0
+            try:
+                transformed = do_transform_pose(pose.pose, transform)
+                marker.points.append(Point(
+                    x=transformed.position.x,
+                    y=transformed.position.y,
+                    z=transformed.position.z
+                ))
+            except Exception as e:
+                self.get_logger().warn(f"Transforming marker point failed: {e}")
+
         marker_array.markers.append(marker)
         self.marker_pub.publish(marker_array)
 
