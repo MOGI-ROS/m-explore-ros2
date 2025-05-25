@@ -84,6 +84,7 @@ class MultiRobotExplorer(Node):
         global_frontiers = self.find_frontiers(self.global_map, reachable_mask)
         self.publish_frontier_markers(global_frontiers, self.global_map, "global_frontiers", source_frame="world")
 
+        self.get_logger().info(f"Global frontiers remaining: {len(global_frontiers)}")
         if not global_frontiers:
             self.get_logger().info("No frontiers left in global map. Exploration complete.")
             self.timer.cancel()
@@ -95,9 +96,27 @@ class MultiRobotExplorer(Node):
         self.publish_frontier_markers(local_frontiers_2, self.local_map_2, "robot_2_frontiers", source_frame="robot_2/map")
 
         if local_frontiers_1:
+            local_frontiers_1.sort(key=lambda cell: self.distance_to_cell(cell, self.local_map_1, 'robot_1/base_link', 'robot_1/map'))
             self.send_goal(local_frontiers_1[0], self.local_map_1, 'robot_1/map', self.pub_1)
         if local_frontiers_2:
+            local_frontiers_2.sort(key=lambda cell: self.distance_to_cell(cell, self.local_map_2, 'robot_2/base_link', 'robot_2/map'))
             self.send_goal(local_frontiers_2[0], self.local_map_2, 'robot_2/map', self.pub_2)
+
+    def distance_to_cell(self, cell, map_msg, robot_frame, source_frame):
+        y, x = cell
+        resolution = map_msg.info.resolution
+        origin = map_msg.info.origin.position
+        cx = origin.x + (x + 0.5) * resolution
+        cy = origin.y + (y + 0.5) * resolution
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                source_frame, robot_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5))
+            rx = transform.transform.translation.x
+            ry = transform.transform.translation.y
+            return np.hypot(cx - rx, cy - ry)
+        except Exception as e:
+            self.get_logger().warn(f"TF transform failed for distance calculation: {e}")
+            return float('inf')
 
     def send_goal(self, cell, map_msg, source_frame, pub):
         y, x = cell
