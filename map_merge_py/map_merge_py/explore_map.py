@@ -13,6 +13,7 @@ import rclpy.time
 
 
 class MultiRobotExplorer(Node):
+    unreachable_frontiers = {}  # key: (robot_name, cell), value: (last_close_time, count)
     def __init__(self):
         super().__init__('multi_robot_explorer')
 
@@ -73,6 +74,23 @@ class MultiRobotExplorer(Node):
     def robot2_map_callback(self, msg):
         self.local_map_2 = msg
 
+    def is_frontier_unreachable(self, robot_name, cell, map_msg):
+        now = self.get_clock().now().nanoseconds / 1e9
+        dist = self.distance_to_cell(cell, map_msg, f'{robot_name}/base_link', f'{robot_name}/map')
+        key = (robot_name, cell)
+        if dist > 1.0:
+            self.unreachable_frontiers.pop(key, None)
+            return False
+        if key not in self.unreachable_frontiers:
+            self.unreachable_frontiers[key] = (now, 1)
+            return False
+        last_time, count = self.unreachable_frontiers[key]
+        if now - last_time > 10.0:
+            self.get_logger().warn(f"Excluding unreachable frontier {cell} for {robot_name}")
+            return True
+        self.unreachable_frontiers[key] = (last_time, count + 1)
+        return False
+
     def explore(self):
         if not self.global_map or not self.local_map_1 or not self.local_map_2:
             self.get_logger().warn("Waiting for all maps...")
@@ -90,8 +108,8 @@ class MultiRobotExplorer(Node):
             self.timer.cancel()
             return
 
-        local_frontiers_1 = self.find_frontiers(self.local_map_1)
-        local_frontiers_2 = self.find_frontiers(self.local_map_2)
+        local_frontiers_1 = [f for f in self.find_frontiers(self.local_map_1) if not self.is_frontier_unreachable('robot_1', f, self.local_map_1)]
+        local_frontiers_2 = [f for f in self.find_frontiers(self.local_map_2) if not self.is_frontier_unreachable('robot_2', f, self.local_map_2)]
         self.publish_frontier_markers(local_frontiers_1, self.local_map_1, "robot_1_frontiers", source_frame="robot_1/map")
         self.publish_frontier_markers(local_frontiers_2, self.local_map_2, "robot_2_frontiers", source_frame="robot_2/map")
 
