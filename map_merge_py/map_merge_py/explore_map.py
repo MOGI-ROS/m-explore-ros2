@@ -13,6 +13,8 @@ import rclpy.time
 
 
 class MultiRobotExplorer(Node):
+    unreachable_frontiers = {}  # key: (robot_name, cell), value: last_close_time
+    blacklisted_frontiers = set()  # key: (robot_name, cell)
     unreachable_frontiers = {}  # key: (robot_name, cell), value: (last_close_time, count)
     def __init__(self):
         super().__init__('multi_robot_explorer')
@@ -75,20 +77,25 @@ class MultiRobotExplorer(Node):
         self.local_map_2 = msg
 
     def is_frontier_unreachable(self, robot_name, cell, map_msg):
+        key = (robot_name, cell)
+        if key in self.blacklisted_frontiers:
+            return True
+
         now = self.get_clock().now().nanoseconds / 1e9
         dist = self.distance_to_cell(cell, map_msg, f'{robot_name}/base_link', f'{robot_name}/map')
-        key = (robot_name, cell)
         if dist > 1.0:
             self.unreachable_frontiers.pop(key, None)
             return False
+
         if key not in self.unreachable_frontiers:
-            self.unreachable_frontiers[key] = (now, 1)
+            self.unreachable_frontiers[key] = now
             return False
-        last_time, count = self.unreachable_frontiers[key]
-        if now - last_time > 10.0:
-            self.get_logger().warn(f"Excluding unreachable frontier {cell} for {robot_name}")
+
+        if now - self.unreachable_frontiers[key] > 10.0:
+            self.get_logger().warn(f"Permanently blacklisting unreachable frontier {cell} for {robot_name}")
+            self.blacklisted_frontiers.add(key)
             return True
-        self.unreachable_frontiers[key] = (last_time, count + 1)
+
         return False
 
     def explore(self):
