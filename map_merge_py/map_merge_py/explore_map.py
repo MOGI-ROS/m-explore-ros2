@@ -1,28 +1,34 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from rosgraph_msgs.msg import Clock
-
+from rcl_interfaces.msg import SetParametersResult
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
-
+from visualization_msgs.msg import Marker, MarkerArray
+from builtin_interfaces.msg import Duration
 import numpy as np
+import rclpy.time
 
 
 class MultiRobotExplorer(Node):
     def __init__(self):
         super().__init__('multi_robot_explorer')
 
-        # sim_time parameter
+        # Parameters
         self.declare_parameter('sim_time', True)
         self.sim_time = self.get_parameter('sim_time').get_parameter_value().bool_value
+        self.declare_parameter('min_unknown_cells', 15)
+        self.min_unknown_cells = self.get_parameter('min_unknown_cells').get_parameter_value().integer_value
 
+        self.add_on_set_parameters_callback(self.update_parameter_callback)
+
+        # Time and TF
         self.latest_clock = None
         if self.sim_time:
             self.create_subscription(Clock, '/clock', self.clock_callback, 10)
 
-        # TF buffer and listener
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -35,15 +41,26 @@ class MultiRobotExplorer(Node):
         self.pub_1 = self.create_publisher(PoseStamped, '/robot_1/goal_pose', 10)
         self.pub_2 = self.create_publisher(PoseStamped, '/robot_2/goal_pose', 10)
 
+        # Marker publisher
+        self.marker_pub = self.create_publisher(MarkerArray, '/frontier_markers', 10)
+
         # Exploration timer
         self.timer = self.create_timer(2.0, self.explore)
 
-        # Map holders
+        # Maps
         self.global_map = None
         self.local_map_1 = None
         self.local_map_2 = None
 
-        self.get_logger().info(f"Multi-robot explorer initialized (sim_time={self.sim_time})")
+    def update_parameter_callback(self, params):
+        result = SetParametersResult(successful=True)
+        for param in params:
+            if param.name == 'min_unknown_cells' and param.type_ == rclpy.Parameter.Type.INTEGER:
+                self.min_unknown_cells = param.value
+                self.get_logger().info(f'Updating minimum uknown cells threshold to {self.min_unknown_cells}')
+                return result
+        # Return success, so updates are seen via get_parameter()
+        return result
 
     def clock_callback(self, msg):
         self.latest_clock = msg.clock
@@ -62,8 +79,12 @@ class MultiRobotExplorer(Node):
             self.get_logger().warn("Waiting for all maps...")
             return
 
-        global_frontiers = self.find_frontiers(self.global_map)
-        self.get_logger().info(f"Global frontiers: {len(global_frontiers)}")
+
+        mask_1 = self.compute_reachability_mask(self.global_map, 'robot_1/map')
+        mask_2 = self.compute_reachability_mask(self.global_map, 'robot_2/map')
+        reachable_mask = np.logical_or(mask_1, mask_2)
+        global_frontiers = self.find_frontiers(self.global_map, reachable_mask)
+        self.publish_frontier_markers(global_frontiers, self.global_map, "global_frontiers")
 
         if not global_frontiers:
             self.get_logger().info("No frontiers left in global map. Exploration complete.")
@@ -72,25 +93,19 @@ class MultiRobotExplorer(Node):
 
         local_frontiers_1 = self.find_frontiers(self.local_map_1)
         local_frontiers_2 = self.find_frontiers(self.local_map_2)
-
-        self.get_logger().info(
-            f"Robot 1 frontiers: {len(local_frontiers_1)} | Robot 2 frontiers: {len(local_frontiers_2)}"
-        )
+        self.publish_frontier_markers(local_frontiers_1, self.global_map, "robot_1_frontiers")
+        self.publish_frontier_markers(local_frontiers_2, self.global_map, "robot_2_frontiers")
 
         if local_frontiers_1:
             self.send_goal(local_frontiers_1[0], self.local_map_1, 'robot_1/map', self.pub_1)
         if local_frontiers_2:
             self.send_goal(local_frontiers_2[0], self.local_map_2, 'robot_2/map', self.pub_2)
 
-        if not local_frontiers_1 and not local_frontiers_2:
-            self.get_logger().info("Frontiers exist globally, but none are visible to either robot.")
-
     def send_goal(self, cell, map_msg, source_frame, pub):
         y, x = cell
         resolution = map_msg.info.resolution
         origin = map_msg.info.origin.position
 
-        # Create goal in local frame
         local_goal = PoseStamped()
         local_goal.header.frame_id = source_frame
         local_goal.header.stamp = self.latest_clock if self.sim_time and self.latest_clock else self.get_clock().now().to_msg()
@@ -99,49 +114,128 @@ class MultiRobotExplorer(Node):
         local_goal.pose.position.z = 0.0
         local_goal.pose.orientation.w = 1.0
 
-        # Transform to world frame
         try:
             transform = self.tf_buffer.lookup_transform(
-                'world',
-                source_frame,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.5)
+                'world', source_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5)
             )
             world_goal = PoseStamped()
             world_goal.pose = do_transform_pose(local_goal.pose, transform)
-            world_goal.header.stamp = local_goal.header.stamp  # preserve correct stamp
+            world_goal.header.stamp = local_goal.header.stamp
             world_goal.header.frame_id = 'world'
             pub.publish(world_goal)
 
-            self.get_logger().info(
-                f"Sent goal to {pub.topic} at ({world_goal.pose.position.x:.2f}, {world_goal.pose.position.y:.2f}) in world frame"
-            )
+            self.get_logger().info(f"Sent goal to {pub.topic} at ({world_goal.pose.position.x:.2f}, {world_goal.pose.position.y:.2f})")
         except Exception as e:
             self.get_logger().warn(f"TF transform failed from {source_frame} to world: {e}")
 
-    def find_frontiers(self, map_msg):
+    def compute_reachability_mask(self, map_msg, source_frame):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                map_msg.header.frame_id, source_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5)
+            )
+            tx = transform.transform.translation.x
+            ty = transform.transform.translation.y
+        except Exception as e:
+            self.get_logger().warn(f"Could not get TF for reachability mask: {e}")
+            return np.ones((map_msg.info.height, map_msg.info.width), dtype=bool)
+
+        resolution = map_msg.info.resolution
+        ox = map_msg.info.origin.position.x
+        oy = map_msg.info.origin.position.y
+        sx = int((tx - ox) / resolution)
+        sy = int((ty - oy) / resolution)
+
+        height = map_msg.info.height
+        width = map_msg.info.width
+        data = np.array(map_msg.data, dtype=np.int8).reshape((height, width))
+        reachable = np.zeros((height, width), dtype=bool)
+        visited = np.zeros((height, width), dtype=bool)
+
+        if not (0 <= sx < width and 0 <= sy < height):
+            self.get_logger().warn("Robot start pose out of map bounds for reachability")
+            return reachable
+
+        queue = [(sy, sx)]
+        while queue:
+            y, x = queue.pop()
+            if visited[y, x]:
+                continue
+            visited[y, x] = True
+            if data[y, x] != 0:
+                continue
+            reachable[y, x] = True
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and not visited[ny, nx]:
+                        queue.append((ny, nx))
+        return reachable
+
+    def find_frontiers(self, map_msg, reachable_mask=None):
         height = map_msg.info.height
         width = map_msg.info.width
         data = np.array(map_msg.data, dtype=np.int8).reshape((height, width))
         frontiers = []
 
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
+        for y in range(2, height - 2):
+            for x in range(2, width - 2):
                 if data[y, x] != 0:
                     continue
-                for dy in [-1, 0, 1]:
-                    for dx in [-1, 0, 1]:
-                        if dy == 0 and dx == 0:
-                            continue
-                        ny, nx = y + dy, x + dx
-                        if data[ny, nx] == -1:
-                            frontiers.append((y, x))
-                            break
-                    else:
-                        continue
-                    break
-
+                if reachable_mask is not None and not reachable_mask[y, x]:
+                    continue
+                neighborhood = data[y-1:y+2, x-1:x+2].flatten()
+                if -1 not in neighborhood:
+                    continue
+                unknown_area = data[y-2:y+3, x-2:x+3]
+                if np.sum(unknown_area == -1) < self.min_unknown_cells:
+                    continue
+                if np.sum(unknown_area == 100) > 2:
+                    continue
+                frontiers.append((y, x))
         return frontiers
+
+    def publish_frontier_markers(self, frontiers, map_msg, ns="frontiers"):
+        marker_array = MarkerArray()
+        marker = Marker()
+        marker.header.frame_id = "world"
+        marker.header.stamp = self.latest_clock if self.sim_time and self.latest_clock else self.get_clock().now().to_msg()
+        marker.ns = ns
+        marker.id = 0
+        marker.type = Marker.SPHERE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+        if ns == "global_frontiers":
+            marker.color.r = 1.0
+            marker.color.g = 0.5
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+        elif ns == "robot_1_frontiers":
+            marker.color.r = 0.1
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+        elif ns == "robot_2_frontiers":
+            marker.color.r = 0.1
+            marker.color.g = 0.0
+            marker.color.b = 1.0
+            marker.color.a = 1.0
+        else:
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+        marker.lifetime = Duration(sec=2)
+
+        resolution = map_msg.info.resolution
+        origin = map_msg.info.origin.position
+        for y, x in frontiers:
+            px = origin.x + (x + 0.5) * resolution
+            py = origin.y + (y + 0.5) * resolution
+            marker.points.append(Point(x=px, y=py, z=0.1))
+        marker_array.markers.append(marker)
+        self.marker_pub.publish(marker_array)
 
 
 def main(args=None):
@@ -150,7 +244,3 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
